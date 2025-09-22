@@ -1,3 +1,18 @@
+/**
+ * form-checker - notify when a Google Form becomes accepting.
+ * - Tries multiple fetch heuristics to detect accepting state.
+ * - If blocked by sign-in, will send a STATUS notification once and repeat every STATUS_REPEAT_MINUTES.
+ * - Does NOT notify when page explicitly says form closed or on fetch errors.
+ *
+ * ENV:
+ * - FORM_URL
+ * - TELEGRAM_BOT_TOKEN
+ * - TELEGRAM_CHAT_ID
+ * - SECRET_KEY
+ * - STATUS_REPEAT_MINUTES (optional, default 60)
+ * - FORCE_NOTIFY (optional, for testing)
+ */
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -11,6 +26,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const SECRET_KEY = process.env.SECRET_KEY;
 const FORCE_NOTIFY_ENV = (process.env.FORCE_NOTIFY || 'false').toLowerCase() === 'true';
+const STATUS_REPEAT_MINUTES = parseInt(process.env.STATUS_REPEAT_MINUTES || '60', 10);
+
 const STATE_FILE = path.join(__dirname, 'state.json');
 const DEBUG_HTML_FILE = path.join(__dirname, 'last_html_debug.html');
 const TELEGRAM_LOG = path.join(__dirname, 'telegram_log.json');
@@ -21,6 +38,7 @@ console.log('TELEGRAM_BOT_TOKEN set:', !!TELEGRAM_BOT_TOKEN);
 console.log('TELEGRAM_CHAT_ID:', TELEGRAM_CHAT_ID ? TELEGRAM_CHAT_ID : '(not set)');
 console.log('SECRET_KEY set:', !!SECRET_KEY);
 console.log('FORCE_NOTIFY_ENV:', FORCE_NOTIFY_ENV);
+console.log('STATUS_REPEAT_MINUTES:', STATUS_REPEAT_MINUTES);
 
 if (!FORM_URL || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !SECRET_KEY) {
   console.error('❌ Missing required env vars. See .env.example');
@@ -43,8 +61,12 @@ function loadState() {
 }
 
 function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  console.log('Saved state:', state);
+  // merge with existing to avoid losing other keys (like last_status_sent)
+  let cur = {};
+  try { cur = fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : {}; } catch (e) {}
+  const merged = { ...cur, ...state };
+  fs.writeFileSync(STATE_FILE, JSON.stringify(merged, null, 2));
+  console.log('Saved state:', merged);
 }
 
 /* ---------- fetch & parse ---------- */
@@ -95,15 +117,12 @@ function parseAcceptingFromHtml(html) {
 
 /* ---------- alternate fetch attempts (heuristics) ---------- */
 function buildAlternativeUrls(formUrl) {
-  // Try variants commonly used to reveal the form
   const variants = [];
-  // original
   variants.push(formUrl);
-  // try adding usp params
   variants.push(formUrl + '?usp=sf_link');
   variants.push(formUrl + '?usp=pp_url');
   variants.push(formUrl + '&embedded=true');
-  // sometimes e/ id form link pattern - try /e/ path if original is /d/
+
   const m = formUrl.match(/\/forms\/d\/(?:e\/)?([^\/\?]+)/);
   if (m && m[1]) {
     const id = m[1];
@@ -111,7 +130,6 @@ function buildAlternativeUrls(formUrl) {
     variants.push(`https://docs.google.com/forms/d/${id}/viewform`);
     variants.push(`https://docs.google.com/forms/d/e/${id}/viewform?embedded=true`);
   }
-  // dedupe
   return [...new Set(variants)];
 }
 
@@ -121,18 +139,14 @@ async function tryAlternativeFetches(formUrl) {
   for (const u of urls) {
     try {
       const html = await fetchHtml(u);
-      // quick parse check
       const parsed = parseAcceptingFromHtml(html);
       console.log('Alt parse for', u, '=>', parsed);
       if (parsed.accepting) {
-        // save debug html for inspection
         try { fs.writeFileSync(DEBUG_HTML_FILE, html, 'utf8'); } catch (e) {}
         return parsed;
       }
-      // if we hit something that's not sign-in and not closed but ambiguous, keep trying
     } catch (e) {
       console.warn('Alt fetch error for', u, e.message);
-      // continue trying other URLs
     }
   }
   return null;
@@ -202,32 +216,65 @@ app.get('/check', async (req, res) => {
     console.log('Primary parse detected sign-in. Attempting alternative fetches...');
     const altParsed = await tryAlternativeFetches(FORM_URL);
     if (altParsed) {
-      // We found an alternative that shows accepting=true
       parsed = altParsed;
       console.log('Alternative fetch succeeded and shows accepting=true');
     } else {
-      // still blocked: here is the change requested:
-      // If previously closed, still send a STATUS notification (caveated) and mark state as accepting=true
-      // so you get a one-time status message.
-      if (prev.accepting === false || prev.accepting === null) {
-        const now = new Date().toISOString();
-        const statusMsg = `ℹ️ Google Form status: POSSIBLY ACTIVE (blocked view)\n${FORM_URL}\nChecked at: ${now}\nNote: server fetch returned a sign-in/blocked page; cannot fully verify content.`;
+      // Use the new periodic/status logic (your provided snippet)
+      console.log('Detected blocked-signin:', parsed.reason);
+
+      const now = new Date();
+      const lastStatusSent = prev.last_status_sent ? new Date(prev.last_status_sent) : null;
+      const prevAccepting = typeof prev.accepting === 'boolean' ? prev.accepting : false;
+
+      // If we never sent a status (prevAccepting is false/null), send immediately
+      if (!prevAccepting) {
+        const statusMsg = `ℹ️ Google Form status: POSSIBLY ACTIVE (blocked view)\n${FORM_URL}\nChecked at: ${now.toISOString()}\nNote: server fetch returned a sign-in/blocked page; cannot fully verify content.`;
         try {
-          console.log('Sending STATUS notification despite blocked view (as requested).');
+          console.log('Sending initial STATUS notification (blocked view).');
           await sendTelegramMessage(statusMsg);
+          // mark as accepting=true to avoid immediate repeats; also save last_status_sent
+          saveState({ accepting: true, last_checked: now.toISOString(), last_status_sent: now.toISOString() });
+          return res.send({ ok: true, notified: true, accepting: true, reason: 'blocked-signin-status-sent', last_checked: now.toISOString() });
         } catch (e) {
-          console.error('Failed to send status telegram:', e.response?.data || e.message);
-          // do not crash; return error to caller
+          console.error('Failed to send initial status telegram:', e.response?.data || e.message);
           return res.status(500).send({ ok: false, notified: false, error: 'telegram_send_failed', details: e.response?.data || e.message });
         }
-        // Mark state as accepting to avoid repeat notifications until a real close happens.
-        saveState({ accepting: true, last_checked: now });
-        return res.send({ ok: true, notified: true, accepting: true, reason: 'blocked-signin-status-sent', last_checked: now });
+      }
+
+      // If we previously sent status, only resend after STATUS_REPEAT_MINUTES elapsed
+      const repeatMinutes = STATUS_REPEAT_MINUTES;
+      if (lastStatusSent) {
+        const minutesSince = (now - lastStatusSent) / 1000 / 60;
+        console.log(`Minutes since last status: ${minutesSince.toFixed(1)} (repeat threshold ${repeatMinutes} min)`);
+        if (minutesSince >= repeatMinutes) {
+          const statusMsg = `ℹ️ Reminder: Google Form appears active but server view is blocked.\n${FORM_URL}\nChecked at: ${now.toISOString()}\nThis is an automated repeat (every ${repeatMinutes} minutes).`;
+          try {
+            console.log('Sending periodic STATUS notification (blocked view).');
+            await sendTelegramMessage(statusMsg);
+            // update last_status_sent time
+            saveState({ accepting: true, last_checked: now.toISOString(), last_status_sent: now.toISOString() });
+            return res.send({ ok: true, notified: true, accepting: true, reason: 'blocked-signin-status-repeat', last_checked: now.toISOString() });
+          } catch (e) {
+            console.error('Failed to send periodic status telegram:', e.response?.data || e.message);
+            return res.status(500).send({ ok: false, notified: false, error: 'telegram_send_failed', details: e.response?.data || e.message });
+          }
+        } else {
+          // not time yet — update last_checked only
+          saveState({ ...prev, accepting: true, last_checked: now.toISOString() });
+          return res.send({ ok: true, notified: false, accepting: true, reason: 'blocked-signin-waiting', last_checked: now.toISOString(), minutes_since_last: minutesSince.toFixed(1) });
+        }
       } else {
-        // already previously considered accepting, do not send again
-        const now = new Date().toISOString();
-        saveState({ accepting: true, last_checked: now });
-        return res.send({ ok: true, notified: false, accepting: true, reason: 'blocked-signin-no-change', last_checked: now });
+        // lastStatusSent was missing but prevAccepting true — treat as initial send fallback
+        try {
+          const statusMsg = `ℹ️ Google Form status: POSSIBLY ACTIVE (blocked view)\n${FORM_URL}\nChecked at: ${now.toISOString()}\nNote: server fetch returned a sign-in/blocked page; cannot fully verify content.`;
+          console.log('Sending fallback STATUS notification (no last_status_sent recorded).');
+          await sendTelegramMessage(statusMsg);
+          saveState({ accepting: true, last_checked: now.toISOString(), last_status_sent: now.toISOString() });
+          return res.send({ ok: true, notified: true, accepting: true, reason: 'blocked-signin-status-sent-fallback', last_checked: now.toISOString() });
+        } catch (e) {
+          console.error('Failed to send fallback status telegram:', e.response?.data || e.message);
+          return res.status(500).send({ ok: false, notified: false, error: 'telegram_send_failed', details: e.response?.data || e.message });
+        }
       }
     }
   }
@@ -282,7 +329,7 @@ app.get('/debug-fetch', async (req, res) => {
   const providedKey = (req.query.key || req.headers['x-secret'] || '').toString();
   if (!providedKey || providedKey !== SECRET_KEY) return res.status(401).send('unauthorized');
 
-  // try primary
+  // try primary fetch & parse
   try {
     const html = await fetchHtml(FORM_URL);
     fs.writeFileSync(DEBUG_HTML_FILE, html, 'utf8');
