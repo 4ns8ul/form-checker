@@ -148,11 +148,20 @@ app.get('/check', async (req, res) => {
 
   console.log('Parsed result:', parsed, 'prevState:', prevState, 'changed:', changed);
 
+  // Inserted guard: do not notify if sign-in/permission page detected
+  if (reason && reason.toLowerCase().includes('sign-in')) {
+    console.warn('Detected sign-in/permission page. Will not notify. Reason:', reason);
+    // save state (we still persist that we could not access form)
+    const newState = { accepting: false, last_checked: new Date().toISOString() };
+    saveState(newState);
+    return res.send({ ok: true, notified: false, accepting: false, reason, last_checked: newState.last_checked });
+  }
+
   // If sign-in detected, do not notify unless FORCE_NOTIFY_ENV is true and forceQuery requested.
+  // (This block remains for backward compatibility if other sign-in indicators slip through)
   if (reason && reason.toLowerCase().includes('sign-in')) {
     console.warn('Sign-in/blocked page detected. Reason:', reason);
     saveState({ accepting: false, last_checked: now });
-    // if we explicitly force and have the env toggle, allow send for testing
     if (!(FORCE_NOTIFY_ENV && forceQuery)) {
       return res.send({ ok: true, notified: false, accepting: false, reason, last_checked: now });
     }
